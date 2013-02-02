@@ -20,6 +20,7 @@ INSTPROGS   = $(PROGS-yes:%=%$(PROGSSUF)$(EXESUF))
 
 OBJS        = cmdutils.o $(EXEOBJS)
 OBJS-ffmpeg = ffmpeg_opt.o ffmpeg_filter.o
+OBJS-ffplay = ffplay_xv.o
 TESTTOOLS   = audiogen videogen rotozoom tiny_psnr tiny_ssim base64
 HOSTPROGS  := $(TESTTOOLS:%=tests/%) doc/print_options
 TOOLS       = qt-faststart trasher

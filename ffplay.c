@@ -59,6 +59,8 @@
 
 #include <assert.h>
 
+#include "ffplay.h"
+
 const char program_name[] = "ffplay";
 const int program_birth_year = 2003;
 
@@ -118,7 +120,7 @@ typedef struct PacketQueue {
 typedef struct VideoPicture {
     double pts;             // presentation timestamp for this picture
     int64_t pos;            // byte position in file
-    SDL_Overlay *bmp;
+    FFplayVideoOutputTexture *bmp;
     int width, height; /* source height & width */
     int allocated;
     int reallocate;
@@ -312,6 +314,7 @@ static const char *video_codec_name;
 double rdftspeed = 0.02;
 static int64_t cursor_last_shown;
 static int cursor_hidden = 0;
+static FFplayVideoOutput *vo;
 #if CONFIG_AVFILTER
 static char *vfilters = NULL;
 static char *afilters = NULL;
@@ -564,7 +567,7 @@ static void fill_border(int xleft, int ytop, int width, int height, int x, int y
 
 #define BPP 1
 
-static void blend_subrect(AVPicture *dst, const AVSubtitleRect *rect, int imgw, int imgh)
+void blend_subrect(AVPicture *dst, const AVSubtitleRect *rect, int imgw, int imgh)
 {
     int wrap, wrap3, width2, skip2;
     int y, u, v, a, u1, v1, a1, w, h;
@@ -802,9 +805,7 @@ static void video_image_display(VideoState *is)
 {
     VideoPicture *vp;
     SubPicture *sp;
-    AVPicture pict;
     SDL_Rect rect;
-    int i;
 
     vp = &is->pictq[is->pictq_rindex];
     if (vp->bmp) {
@@ -812,29 +813,14 @@ static void video_image_display(VideoState *is)
             if (is->subpq_size > 0) {
                 sp = &is->subpq[is->subpq_rindex];
 
-                if (vp->pts >= sp->pts + ((float) sp->sub.start_display_time / 1000)) {
-                    SDL_LockYUVOverlay (vp->bmp);
-
-                    pict.data[0] = vp->bmp->pixels[0];
-                    pict.data[1] = vp->bmp->pixels[2];
-                    pict.data[2] = vp->bmp->pixels[1];
-
-                    pict.linesize[0] = vp->bmp->pitches[0];
-                    pict.linesize[1] = vp->bmp->pitches[2];
-                    pict.linesize[2] = vp->bmp->pitches[1];
-
-                    for (i = 0; i < sp->sub.num_rects; i++)
-                        blend_subrect(&pict, sp->sub.rects[i],
-                                      vp->bmp->w, vp->bmp->h);
-
-                    SDL_UnlockYUVOverlay (vp->bmp);
-                }
+                if (vp->pts >= sp->pts + ((float) sp->sub.start_display_time / 1000))
+                    vo->blend_texture(vp->bmp, &sp->sub);
             }
         }
 
         calculate_display_rect(&rect, is->xleft, is->ytop, is->width, is->height, vp);
 
-        SDL_DisplayYUVOverlay(vp->bmp, &rect);
+        vo->display_texture(vp->bmp, &rect);
 
         if (rect.x != is->last_display_rect.x || rect.y != is->last_display_rect.y || rect.w != is->last_display_rect.w || rect.h != is->last_display_rect.h || is->force_refresh) {
             int bgcolor = SDL_MapRGB(screen->format, 0x00, 0x00, 0x00);
@@ -1003,10 +989,7 @@ static void stream_close(VideoState *is)
     /* free all pictures */
     for (i = 0; i < VIDEO_PICTURE_QUEUE_SIZE; i++) {
         vp = &is->pictq[i];
-        if (vp->bmp) {
-            SDL_FreeYUVOverlay(vp->bmp);
-            vp->bmp = NULL;
-        }
+        vo->free_texture(&vp->bmp);
     }
     SDL_DestroyMutex(is->pictq_mutex);
     SDL_DestroyCond(is->pictq_cond);
@@ -1044,7 +1027,7 @@ static void sigterm_handler(int sig)
 
 static int video_open(VideoState *is, int force_set_video_mode, VideoPicture *vp)
 {
-    int flags = SDL_HWSURFACE | SDL_ASYNCBLIT | SDL_HWACCEL;
+    int flags = vo->sdl_flags;
     int w,h;
     SDL_Rect rect;
 
@@ -1492,17 +1475,12 @@ static void alloc_picture(VideoState *is)
 
     vp = &is->pictq[is->pictq_windex];
 
-    if (vp->bmp)
-        SDL_FreeYUVOverlay(vp->bmp);
+    vo->free_texture(&vp->bmp);
 
     video_open(is, 0, vp);
 
-    vp->bmp = SDL_CreateYUVOverlay(vp->width, vp->height,
-                                   SDL_YV12_OVERLAY,
-                                   screen);
-    if (!vp->bmp || vp->bmp->pitches[0] < vp->width) {
-        /* SDL allocates a buffer smaller than requested if the video
-         * overlay hardware is unable to support the requested size. */
+    vp->bmp = vo->alloc_texture(vp->width, vp->height);
+    if (!vp->bmp) {
         fprintf(stderr, "Error: the video system does not support an image\n"
                         "size of %dx%d pixels. Try using -lowres or -vf \"scale=w:h\"\n"
                         "to reduce the image size.\n", vp->width, vp->height );
@@ -1513,24 +1491,6 @@ static void alloc_picture(VideoState *is)
     vp->allocated = 1;
     SDL_CondSignal(is->pictq_cond);
     SDL_UnlockMutex(is->pictq_mutex);
-}
-
-static void duplicate_right_border_pixels(SDL_Overlay *bmp) {
-    int i, width, height;
-    Uint8 *p, *maxp;
-    for (i = 0; i < 3; i++) {
-        width  = bmp->w;
-        height = bmp->h;
-        if (i > 0) {
-            width  >>= 1;
-            height >>= 1;
-        }
-        if (bmp->pitches[i] > width) {
-            maxp = bmp->pixels[i] + bmp->pitches[i] * height - 1;
-            for (p = bmp->pixels[i] + width - 1; p < maxp; p += bmp->pitches[i])
-                *(p+1) = *p;
-        }
-    }
 }
 
 static int queue_picture(VideoState *is, AVFrame *src_frame, double pts, int64_t pos, int serial)
@@ -1595,23 +1555,8 @@ static int queue_picture(VideoState *is, AVFrame *src_frame, double pts, int64_t
 
     /* if the frame is not skipped, then display it */
     if (vp->bmp) {
-        AVPicture pict = { { 0 } };
-
-        /* get a pointer on the bitmap */
-        SDL_LockYUVOverlay (vp->bmp);
-
-        pict.data[0] = vp->bmp->pixels[0];
-        pict.data[1] = vp->bmp->pixels[2];
-        pict.data[2] = vp->bmp->pixels[1];
-
-        pict.linesize[0] = vp->bmp->pitches[0];
-        pict.linesize[1] = vp->bmp->pitches[2];
-        pict.linesize[2] = vp->bmp->pitches[1];
-
 #if CONFIG_AVFILTER
-        // FIXME use direct rendering
-        av_picture_copy(&pict, (AVPicture *)src_frame,
-                        src_frame->format, vp->width, vp->height);
+        vo->fill_texture(vp->bmp, src_frame, NULL);
 #else
         av_opt_get_int(sws_opts, "sws_flags", 0, &sws_flags);
         is->img_convert_ctx = sws_getCachedContext(is->img_convert_ctx,
@@ -1621,14 +1566,8 @@ static int queue_picture(VideoState *is, AVFrame *src_frame, double pts, int64_t
             fprintf(stderr, "Cannot initialize the conversion context\n");
             exit(1);
         }
-        sws_scale(is->img_convert_ctx, src_frame->data, src_frame->linesize,
-                  0, vp->height, pict.data, pict.linesize);
+        vo->fill_texture(vp->bmp, src_frame, is->img_convert_ctx);
 #endif
-        /* workaround SDL PITCH_WORKAROUND */
-        duplicate_right_border_pixels(vp->bmp);
-        /* update the bitmap content */
-        SDL_UnlockYUVOverlay(vp->bmp);
-
         vp->pts = pts;
         vp->pos = pos;
         vp->serial = serial;
@@ -3234,7 +3173,7 @@ static void event_loop(VideoState *cur_stream)
             break;
         case SDL_VIDEORESIZE:
                 screen = SDL_SetVideoMode(event.resize.w, event.resize.h, 0,
-                                          SDL_HWSURFACE|SDL_RESIZABLE|SDL_ASYNCBLIT|SDL_HWACCEL);
+                                          SDL_RESIZABLE | vo->sdl_flags);
                 screen_width  = cur_stream->width  = event.resize.w;
                 screen_height = cur_stream->height = event.resize.h;
                 cur_stream->force_refresh = 1;
@@ -3532,6 +3471,8 @@ int main(int argc, char **argv)
 
     av_init_packet(&flush_pkt);
     flush_pkt.data = (char *)(intptr_t)"FLUSH";
+
+    vo = &ffplay_video_output_xv;
 
     is = stream_open(input_filename, file_iformat);
     if (!is) {
