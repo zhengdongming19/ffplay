@@ -319,6 +319,9 @@ static FFplayVideoOutput *vo;
 static char *vfilters = NULL;
 static char *afilters = NULL;
 #endif
+#if CONFIG_FFPLAY_OPENGL
+static int is_opengl_vo = 0;
+#endif
 
 /* current context */
 static int is_full_screen;
@@ -3300,6 +3303,9 @@ static const OptionDef options[] = {
     { "x", HAS_ARG, { .func_arg = opt_width }, "force displayed width", "width" },
     { "y", HAS_ARG, { .func_arg = opt_height }, "force displayed height", "height" },
     { "s", HAS_ARG | OPT_VIDEO, { .func_arg = opt_frame_size }, "set frame size (WxH or abbreviation)", "size" },
+#if CONFIG_FFPLAY_OPENGL
+    { "gl", OPT_BOOL, { &is_opengl_vo }, "use openGL renderer" },
+#endif
     { "fs", OPT_BOOL, { &is_full_screen }, "force full screen" },
     { "an", OPT_BOOL, { &audio_disable }, "disable audio" },
     { "vn", OPT_BOOL, { &video_disable }, "disable video" },
@@ -3473,6 +3479,10 @@ int main(int argc, char **argv)
     flush_pkt.data = (char *)(intptr_t)"FLUSH";
 
     vo = &ffplay_video_output_xv;
+#if CONFIG_FFPLAY_OPENGL
+    if (is_opengl_vo)
+        vo = &ffplay_video_output_gl;
+#endif
 
     is = stream_open(input_filename, file_iformat);
     if (!is) {
